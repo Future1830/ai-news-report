@@ -3,86 +3,106 @@ from email.mime.text import MIMEText
 from datetime import datetime
 import feedparser
 import os
-from translate import Translator  # 免费翻译库，无需 API Key
+import re
+# 用稳定版googletrans做翻译（解决语法错误+翻译失败问题）
+from googletrans import Translator
 
-# 从 GitHub Secrets 读取配置
+# 从GitHub Secrets读取配置
 SENDER_EMAIL = os.getenv("SMTP_EMAIL")
 SENDER_PASS = os.getenv("SMTP_PASSWORD")
 RECEIVER_EMAIL = os.getenv("TO_EMAIL")
 
-# 配置免费翻译（英文→中文）
-translator = Translator(from_lang="english", to_lang="chinese")
+# 初始化翻译器（设置超时，避免卡住）
+translator = Translator(timeout=10)
 
 def clean_text(text):
-    """清理文本：去掉链接、多余空格和特殊符号"""
-    import re
-    # 移除所有网址链接
+    """彻底清理链接和多余格式"""
+    # 移除所有网址
     text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
     # 移除多余空格和换行
     text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    # 只保留前200字，避免内容过长
+    return text[:200]
 
-def get_ai_news():
-    """抓取英文 AI 新闻，只保留标题和摘要"""
+def get_english_news():
+    """抓取英文AI新闻（只取前3条，避免内容过多）"""
     news_sources = [
         "https://techcrunch.com/category/artificial-intelligence/feed/",
         "https://www.technologyreview.com/feed/"
     ]
-    news_list = []
+    english_news = []
     for url in news_sources:
         feed = feedparser.parse(url)
-        # 只取前3条新闻，避免内容过多
         for entry in feed.entries[:3]:
-            # 清理标题和摘要（去链接）
-            clean_title = clean_text(entry.title)
-            clean_summary = clean_text(entry.summary)
-            news_list.append(f"标题：{clean_title}\n摘要：{clean_summary}")
-    return "\n\n".join(news_list)
+            title = clean_text(entry.title)
+            summary = clean_text(entry.summary)
+            english_news.append(f"标题：{title}\n摘要：{summary}")
+    return "\n\n".join(english_news)
 
-def translate_to_chinese(text):
-    """免费翻译英文到中文，生成简洁小结"""
+def translate_to_chinese(english_text):
+    """将英文新闻翻译成简洁中文小结"""
     try:
-        # 分段翻译，避免过长
-        translated_parts = []
-        for part in text.split("\n\n"):
-            if part.strip():
-                # 翻译+精简小结
-                trans_part = translator.translate(part)
-                # 提取核心信息，生成一句话小结
-                if "标题：" in trans_part and "摘要：" in trans_part:
-                    title = trans_part.split("标题：")[1].split("摘要：")[0].strip()
-                    summary = trans_part.split("摘要：")[1].strip()
-                    translated_parts.append(f"🔹 {title}\n  {summary[:100]}...")  # 摘要限制100字
-        return "\n\n".join(translated_parts)
+        # 分段翻译，避免单次翻译过长
+        chinese_parts = []
+        for part in english_text.split("\n\n"):
+            if part.strip() and "标题：" in part:
+                # 拆分标题和摘要分别翻译
+                en_title = part.split("标题：")[1].split("摘要：")[0].strip()
+                en_summary = part.split("摘要：")[1].strip()
+                
+                # 翻译标题和摘要
+                zh_title = translator.translate(en_title, dest='zh-CN').text
+                zh_summary = translator.translate(en_summary, dest='zh-CN').text
+                
+                # 生成精简小结
+                chinese_parts.append(f"🔹 {zh_title}\n  {zh_summary}")
+        
+        # 合并成最终中文内容
+        return "\n\n".join(chinese_parts)
     except Exception as e:
-        return f"⚠️ 翻译失败（原因：{str(e)}），以下是原文：\n{text}"
+        # 翻译失败时返回英文原文（保证脚本不崩溃）
+        return f"⚠️ 翻译服务临时不可用，以下是英文原文：\n{english_text}"
 
 def send_email(content):
-    """发送中文日报到指定邮箱"""
+    """发送纯中文日报到指定邮箱"""
+    # 组装邮件内容
     msg = MIMEText(content, 'plain', 'utf-8')
     msg['Subject'] = f"📰 全球AI日报 | {datetime.now().strftime('%Y-%m-%d')}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECEIVER_EMAIL
 
-    # 适配不同邮箱的 SMTP 配置
-    if "163.com" in SENDER_EMAIL:
-        smtp_server = "smtp.163.com"
-    elif "qq.com" in SENDER_EMAIL:
+    # 自动适配邮箱SMTP服务器（QQ/163通用）
+    if "qq.com" in SENDER_EMAIL:
         smtp_server = "smtp.qq.com"
     else:
-        smtp_server = "smtp.163.com"  # 默认163
+        smtp_server = "smtp.163.com"
 
-    with smtplib.SMTP_SSL(smtp_server, 465) as server:
-        server.login(SENDER_EMAIL, SENDER_PASS)
-        server.send_message(msg)
+    # 发送邮件（带异常处理，避免登录失败崩溃）
+    try:
+        with smtplib.SMTP_SSL(smtp_server, 465) as server:
+            server.login(SENDER_EMAIL, SENDER_PASS)
+            server.send_message(msg)
+        print("邮件发送成功！")
+    except Exception as e:
+        raise Exception(f"邮件发送失败：{str(e)}")
 
 if __name__ == "__main__":
-    # 1. 抓取英文新闻（去链接）
-    raw_news = get_ai_news()
-    # 2. 翻译为中文并生成小结
-    chinese_summary = translate_to_chinese(raw_news)
-    # 3. 组装日报内容
-    report = f"""📰 全球AI日报 | {datetime.now().strftime('%Y-%m-%d')}
+    # 核心执行流程（全程带异常处理，保证不崩溃）
+    try:
+        # 1. 抓取英文新闻（去链接）
+        en_news = get_english_news()
+        # 2. 翻译成中文小结
+        zh_news = translate_to_chinese(en_news)
+        # 3. 组装最终日报
+        final_report = f"""📰 全球AI日报 | {datetime.now().strftime('%Y-%m-%d')}
 
-{chinese_summary}
-   
+{zh_news}
+
+---
+✅ 自动生成（纯中文无链接版）
+🕒 每日北京时间8点更新"""
+        # 4. 发送邮件
+        send_email(final_report)
+    except Exception as e:
+        # 捕获所有异常并抛出，让GitHub Actions显示具体错误
+        raise Exception(f"脚本执行失败：{str(e)}")
